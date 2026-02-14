@@ -63,11 +63,12 @@ const CLOUDFLARE_CSS = `
 
 .cf-dropdown-item:hover {
   background: var(--bg-tertiary, rgba(255,255,255,0.05));
+  border-radius: 0;
 }
 
 .cf-dropdown-divider {
   height: 1px;
-  margin: 4px 0;
+  margin: 0;
 }
 
 .cf-badge {
@@ -203,6 +204,10 @@ const CLOUDFLARE_CSS = `
   font-family: inherit;
 }
 
+.cf-form-input::placeholder {
+  opacity: 0.25;
+}
+
 .cf-form-input:focus {
   border-color: #F6821F;
 }
@@ -331,7 +336,7 @@ const CLOUDFLARE_CSS = `
 }
 
 .cf-btn:hover {
-  opacity: 0.85;
+  filter: brightness(0.9);
 }
 
 .cf-btn:disabled {
@@ -464,6 +469,7 @@ interface LinkedProject {
   accountId: string;
   accountName: string;
   outputDir: string;
+  prodUrl?: string;
 }
 
 interface CloudflareProject {
@@ -502,7 +508,23 @@ function parseProjectList(stdout: string): CloudflareProject[] {
 async function detectOutputDir(
   shell: PluginContextValue['shell']
 ): Promise<string> {
-  const candidates = ['dist', 'build', 'out', '.next', 'public'];
+  // Check package.json for framework hints first — most reliable
+  try {
+    const result = await shell.exec('cat', ['package.json']);
+    if (result.exit_code === 0) {
+      const pkg = result.stdout.toLowerCase();
+      if (pkg.includes('"next"') || pkg.includes("'next'")) return 'out';
+      if (pkg.includes('"nuxt"') || pkg.includes("'nuxt'")) return '.output/public';
+      if (pkg.includes('"vite"') || pkg.includes('"astro"') || pkg.includes('"svelte"') || pkg.includes('"@sveltejs/kit"')) return 'dist';
+      if (pkg.includes('"react-scripts"')) return 'build';
+      if (pkg.includes('"gatsby"')) return 'public';
+    }
+  } catch {
+    // ignore
+  }
+
+  // Fall back to checking which output directories exist
+  const candidates = ['dist', 'build', 'out', 'public'];
   for (const dir of candidates) {
     try {
       const result = await shell.exec('test', ['-d', dir]);
@@ -512,21 +534,16 @@ async function detectOutputDir(
     }
   }
 
-  // Check package.json for framework hints
-  try {
-    const result = await shell.exec('cat', ['package.json']);
-    if (result.exit_code === 0) {
-      const pkg = result.stdout.toLowerCase();
-      if (pkg.includes('"next"') || pkg.includes("'next'")) return 'out';
-      if (pkg.includes('"vite"') || pkg.includes('"astro"') || pkg.includes('"svelte"') || pkg.includes('"@sveltejs/kit"')) return 'dist';
-      if (pkg.includes('"react-scripts"')) return 'build';
-      if (pkg.includes('"gatsby"')) return 'public';
-    }
-  } catch {
-    // ignore
-  }
-
   return 'dist';
+}
+
+function openAutoDeploySetup(
+  actions: PluginContextValue['actions'],
+  accountId: string,
+) {
+  // Open the Cloudflare dashboard to create a Git-connected Pages project.
+  // This gives native auto-deploy on push — same as Vercel's Git integration.
+  actions.openUrl(`https://dash.cloudflare.com/${accountId}/pages/new/provider/gh`);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +579,7 @@ function ConnectModal({
   shell,
   storage,
   showToast,
+  actions,
   theme,
   onLinked,
 }: {
@@ -570,6 +588,7 @@ function ConnectModal({
   shell: PluginContextValue['shell'];
   storage: PluginContextValue['storage'];
   showToast: PluginContextValue['actions']['showToast'];
+  actions: PluginContextValue['actions'];
   theme: PluginContextValue['theme'];
   onLinked: (project: LinkedProject) => void;
 }) {
@@ -587,6 +606,7 @@ function ConnectModal({
   const [selectedExisting, setSelectedExisting] = useState<string | null>(null);
 
   // Auto-detect output directory
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     let cancelled = false;
     detectOutputDir(shell).then((dir) => {
@@ -596,9 +616,10 @@ function ConnectModal({
       }
     });
     return () => { cancelled = true; };
-  }, [shell]);
+  }, []);
 
   // Load existing projects when link tab selected or account changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (tab !== 'link' || !selectedAccountId) return;
     let cancelled = false;
@@ -607,7 +628,7 @@ function ConnectModal({
     setSelectedExisting(null);
 
     shell
-      .exec('npx', ['--yes', 'wrangler', 'pages', 'project', 'list', '--account-id', selectedAccountId])
+      .exec('sh', ['-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project list`])
       .then((result) => {
         if (cancelled) return;
         if (result.exit_code === 0) {
@@ -620,7 +641,7 @@ function ConnectModal({
       });
 
     return () => { cancelled = true; };
-  }, [tab, selectedAccountId, shell]);
+  }, [tab, selectedAccountId]);
 
   // Close on Escape
   useEffect(() => {
@@ -655,8 +676,8 @@ function ConnectModal({
 
     try {
       // Create the project
-      const createResult = await shell.exec('npx', [
-        '--yes', 'wrangler', 'pages', 'project', 'create', sanitized, '--production-branch', 'main', '--account-id', selectedAccountId,
+      const createResult = await shell.exec('sh', [
+        '-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project create ${sanitized} --production-branch main`,
       ]);
 
       if (createResult.exit_code !== 0) {
@@ -679,14 +700,38 @@ function ConnectModal({
       // Save to storage
       await storage.write(linked as unknown as Record<string, unknown>);
 
-      // Deploy
+      // Build then deploy
       try {
-        await shell.exec(
-          'npx',
-          ['--yes', 'wrangler', 'pages', 'deploy', outputDir, '--project-name', sanitized, '--account-id', selectedAccountId],
+        const buildResult = await shell.exec('npm', ['run', 'build'], { timeout: 300000 });
+        if (buildResult.exit_code !== 0) {
+          setError(`Build failed: ${buildResult.stderr || buildResult.stdout}`);
+          setLoading(false);
+          return;
+        }
+
+        // Verify output directory exists
+        const dirCheck = await shell.exec('test', ['-d', outputDir]);
+        if (dirCheck.exit_code !== 0) {
+          setError(`Build succeeded but "${outputDir}" folder was not created. Check your framework's output settings — for Next.js, add \`output: 'export'\` to next.config.`);
+          setLoading(false);
+          return;
+        }
+
+        const deployResult = await shell.exec(
+          'sh',
+          ['-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages deploy ${outputDir} --project-name ${sanitized}`],
           { timeout: 300000 }
         );
-        showToast('Deployed to Cloudflare Pages!', 'success');
+        // Parse the real URL from deploy output (e.g. "https://abc123.my-project.pages.dev")
+        const urlMatch = (deployResult.stdout + '\n' + deployResult.stderr).match(/https:\/\/[^\s]*\.pages\.dev/);
+        if (urlMatch) {
+          // Extract the production URL (strip the deploy hash prefix)
+          const deployUrl = urlMatch[0];
+          const pagesDevMatch = deployUrl.match(/https:\/\/[^.]+\.(.+\.pages\.dev)/);
+          linked.prodUrl = pagesDevMatch ? `https://${pagesDevMatch[1]}` : deployUrl;
+          await storage.write(linked as unknown as Record<string, unknown>);
+        }
+        showToast('Deployed! Setting up auto-deploy...', 'success');
       } catch {
         showToast('Connected! Deploy may still be running.', 'success');
       }
@@ -715,15 +760,18 @@ function ConnectModal({
 
     try {
       const account = getSelectedAccount();
+      const existingProject = existingProjects.find((p) => p.name === selectedExisting);
       const linked: LinkedProject = {
         projectName: selectedExisting,
         accountId: selectedAccountId,
         accountName: account?.name ?? '',
         outputDir,
+        prodUrl: existingProject?.subdomain ? `https://${existingProject.subdomain}` : undefined,
       };
 
       await storage.write(linked as unknown as Record<string, unknown>);
       showToast(`Linked to ${selectedExisting}`, 'success');
+
       onLinked(linked);
       onClose();
     } catch (err) {
@@ -731,7 +779,7 @@ function ConnectModal({
     } finally {
       setLoading(false);
     }
-  }, [selectedExisting, selectedAccountId, outputDir, storage, showToast, onLinked, onClose]);
+  }, [selectedExisting, selectedAccountId, outputDir, shell, storage, showToast, onLinked, onClose]);
 
   const selectedAccount = getSelectedAccount();
 
@@ -820,6 +868,9 @@ function ConnectModal({
                   placeholder="my-site"
                   value={projectName}
                   onChange={(e) => setProjectName(e.target.value)}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
                 {projectName && sanitizeProjectName(projectName) !== projectName && (
                   <div className="cf-form-hint">
@@ -835,9 +886,12 @@ function ConnectModal({
                   type="text"
                   value={outputDir}
                   onChange={(e) => setOutputDir(e.target.value)}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
                 <div className="cf-form-hint">
-                  {detectingDir ? 'Detecting...' : 'Build output folder to deploy'}
+                  {detectingDir ? 'Detecting...' : 'The folder your build tool outputs to (e.g. dist, build, out)'}
                 </div>
               </div>
             </>
@@ -876,9 +930,12 @@ function ConnectModal({
                   type="text"
                   value={outputDir}
                   onChange={(e) => setOutputDir(e.target.value)}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
                 <div className="cf-form-hint">
-                  {detectingDir ? 'Detecting...' : 'Build output folder to deploy'}
+                  {detectingDir ? 'Detecting...' : 'The folder your build tool outputs to (e.g. dist, build, out)'}
                 </div>
               </div>
             </>
@@ -943,7 +1000,8 @@ function ConnectedDropdown({
   isDeploying: boolean;
 }) {
   const dashboardUrl = `https://dash.cloudflare.com/${linked.accountId}/pages/view/${linked.projectName}`;
-  const prodUrl = `https://${linked.projectName}.pages.dev`;
+  const prodUrl = linked.prodUrl || `https://${linked.projectName}.pages.dev`;
+  const prodLabel = prodUrl.replace('https://', '');
 
   return (
     <div className="cf-dropdown" style={{ background: theme.bgPrimary, border: `1px solid ${theme.border}` }}>
@@ -955,8 +1013,8 @@ function ConnectedDropdown({
         <span className="cf-badge" style={{ background: 'rgba(246, 130, 31, 0.15)', color: '#F6821F' }}>
           PROD
         </span>
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {linked.projectName}.pages.dev
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {prodLabel}
         </span>
         <ExternalLinkIcon />
       </button>
@@ -986,13 +1044,22 @@ function ConnectedDropdown({
         )}
       </button>
 
+      {/* Auto-deploy via Cloudflare Git integration */}
+      <button
+        className="cf-dropdown-item"
+        onClick={() => openAutoDeploySetup(actions, linked.accountId)}
+      >
+        Enable Auto-Deploy
+        <ExternalLinkIcon />
+      </button>
+
       <div className="cf-dropdown-divider" style={{ background: theme.border }} />
 
       {/* Unlink */}
       <button
         className="cf-dropdown-item"
         onClick={onUnlink}
-        style={{ color: theme.error }}
+        style={{ color: theme.error, justifyContent: 'center' }}
       >
         Disconnect Project
       </button>
@@ -1023,6 +1090,7 @@ function CloudflareToolbar() {
   const [showModal, setShowModal] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [hasGitRemote, setHasGitRemote] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -1037,6 +1105,7 @@ function CloudflareToolbar() {
   })();
 
   // Check CLI status on mount — single whoami call (proves installed + checks auth)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     let cancelled = false;
 
@@ -1077,7 +1146,28 @@ function CloudflareToolbar() {
           try {
             const data = await storage.read();
             if (data.projectName && data.accountId) {
-              setLinked(data as unknown as LinkedProject);
+              const linkedData = data as unknown as LinkedProject;
+
+              // Backfill prodUrl if missing (old stored data)
+              if (!linkedData.prodUrl) {
+                try {
+                  const listResult = await shell.exec('sh', [
+                    '-c', `CLOUDFLARE_ACCOUNT_ID=${linkedData.accountId} npx --yes wrangler pages project list`
+                  ]);
+                  if (listResult.exit_code === 0) {
+                    const projects = parseProjectList(listResult.stdout);
+                    const match = projects.find((p) => p.name === linkedData.projectName);
+                    if (match?.subdomain) {
+                      linkedData.prodUrl = `https://${match.subdomain}`;
+                      await storage.write(linkedData as unknown as Record<string, unknown>);
+                    }
+                  }
+                } catch {
+                  // Non-critical — will use fallback URL
+                }
+              }
+
+              setLinked(linkedData);
             }
           } catch {
             // Storage empty or corrupt — not linked
@@ -1092,7 +1182,29 @@ function CloudflareToolbar() {
 
     check();
     return () => { cancelled = true; };
-  }, [shell, storage]);
+  }, []);
+
+  // Poll for git remote until one is found
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (hasGitRemote) return;
+    let cancelled = false;
+
+    async function checkRemote() {
+      try {
+        const result = await shell.exec('git', ['remote', '-v']);
+        if (!cancelled && result.exit_code === 0 && result.stdout.trim()) {
+          setHasGitRemote(true);
+        }
+      } catch {
+        // No git remote yet
+      }
+    }
+
+    checkRemote();
+    const interval = setInterval(checkRemote, 5000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [hasGitRemote]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -1173,12 +1285,39 @@ function CloudflareToolbar() {
     setShowDropdown(false);
 
     try {
+      showToast('Building project...', 'success');
+      const buildResult = await shell.exec('npm', ['run', 'build'], { timeout: 300000 });
+      if (buildResult.exit_code !== 0) {
+        showToast(`Build failed: ${buildResult.stderr || buildResult.stdout}`, 'error');
+        setIsDeploying(false);
+        return;
+      }
+
+      // Verify output directory exists
+      const dirCheck = await shell.exec('test', ['-d', linked.outputDir]);
+      if (dirCheck.exit_code !== 0) {
+        showToast(`Build succeeded but "${linked.outputDir}" folder not found. Check your framework's output settings.`, 'error');
+        setIsDeploying(false);
+        return;
+      }
+
       const result = await shell.exec(
-        'npx',
-        ['--yes', 'wrangler', 'pages', 'deploy', linked.outputDir, '--project-name', linked.projectName, '--account-id', linked.accountId],
+        'sh',
+        ['-c', `CLOUDFLARE_ACCOUNT_ID=${linked.accountId} npx --yes wrangler pages deploy ${linked.outputDir} --project-name ${linked.projectName}`],
         { timeout: 300000 }
       );
       if (result.exit_code === 0) {
+        // Update prodUrl if we can parse it from deploy output
+        if (!linked.prodUrl) {
+          const urlMatch = (result.stdout + '\n' + result.stderr).match(/https:\/\/[^\s]*\.pages\.dev/);
+          if (urlMatch) {
+            const pagesDevMatch = urlMatch[0].match(/https:\/\/[^.]+\.(.+\.pages\.dev)/);
+            const realUrl = pagesDevMatch ? `https://${pagesDevMatch[1]}` : urlMatch[0];
+            const updated = { ...linked, prodUrl: realUrl };
+            setLinked(updated);
+            await storage.write(updated as unknown as Record<string, unknown>);
+          }
+        }
         showToast('Deployed to Cloudflare Pages!', 'success');
       } else {
         showToast(`Deploy failed: ${result.stderr}`, 'error');
@@ -1188,7 +1327,7 @@ function CloudflareToolbar() {
     } finally {
       setIsDeploying(false);
     }
-  }, [linked, shell, showToast]);
+  }, [linked, shell, showToast, storage]);
 
   const handleUnlink = useCallback(async () => {
     try {
@@ -1256,6 +1395,7 @@ function CloudflareToolbar() {
       );
 
     case 'NOT_LINKED':
+      if (!hasGitRemote) return null;
       return (
         <>
           <button
@@ -1273,6 +1413,7 @@ function CloudflareToolbar() {
               shell={shell}
               storage={storage}
               showToast={showToast}
+              actions={actions}
               theme={theme}
               onLinked={handleLinked}
             />
@@ -1301,7 +1442,7 @@ function CloudflareToolbar() {
           onMouseLeave={handleMouseLeave}
         >
           <button
-            className="education-button"
+            className="toolbar-icon-btn"
             onClick={() => actions.openUrl(`https://dash.cloudflare.com/${linked!.accountId}/pages/view/${linked!.projectName}`)}
             title={`${linked!.projectName} — Cloudflare Pages`}
           >
