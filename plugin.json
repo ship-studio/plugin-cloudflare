@@ -1,0 +1,9 @@
+{
+  "id": "cloudflare",
+  "name": "Cloudflare Pages",
+  "description": "Deploy to Cloudflare Pages with one click using the Wrangler CLI.",
+  "version": "1.0.0",
+  "slots": ["toolbar"],
+  "min_app_version": "0.3.53",
+  "api_version": 1
+}
