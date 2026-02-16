@@ -986,6 +986,7 @@ function ConnectedDropdown({
   showToast,
   storage,
   onUnlink,
+  onSignOut,
   onDeploy,
   isDeploying,
 }: {
@@ -996,6 +997,7 @@ function ConnectedDropdown({
   showToast: PluginContextValue['actions']['showToast'];
   storage: PluginContextValue['storage'];
   onUnlink: () => void;
+  onSignOut: () => void;
   onDeploy: () => void;
   isDeploying: boolean;
 }) {
@@ -1059,9 +1061,17 @@ function ConnectedDropdown({
       <button
         className="cf-dropdown-item"
         onClick={onUnlink}
-        style={{ color: theme.error, justifyContent: 'center' }}
       >
         Disconnect Project
+      </button>
+
+      {/* Sign out */}
+      <button
+        className="cf-dropdown-item"
+        onClick={onSignOut}
+        style={{ color: theme.error }}
+      >
+        Sign Out
       </button>
     </div>
   );
@@ -1071,7 +1081,7 @@ function ConnectedDropdown({
 // Main Toolbar Component
 // ---------------------------------------------------------------------------
 
-type PluginState = 'CHECKING' | 'NOT_INSTALLED' | 'NOT_AUTHENTICATED' | 'NOT_LINKED' | 'DEPLOYING' | 'CONNECTED';
+type PluginState = 'CHECKING' | 'NOT_INSTALLED' | 'NOT_AUTHENTICATED' | 'WRONG_ACCOUNT' | 'NOT_LINKED' | 'DEPLOYING' | 'CONNECTED';
 
 function CloudflareToolbar() {
   const ctx = usePluginContext();
@@ -1099,6 +1109,7 @@ function CloudflareToolbar() {
     if (cliStatus === null) return 'CHECKING';
     if (!cliStatus.installed) return 'NOT_INSTALLED';
     if (!cliStatus.authenticated) return 'NOT_AUTHENTICATED';
+    if (linked && accounts.length > 0 && !accounts.some((a) => a.id === linked.accountId)) return 'WRONG_ACCOUNT';
     if (isDeploying) return 'DEPLOYING';
     if (linked) return 'CONNECTED';
     return 'NOT_LINKED';
@@ -1340,6 +1351,20 @@ function CloudflareToolbar() {
     }
   }, [storage, showToast]);
 
+  const handleSignOut = useCallback(async () => {
+    setShowDropdown(false);
+    try {
+      await shell.exec('npx', ['--yes', 'wrangler', 'logout'], { timeout: 30000 });
+      await storage.write({});
+      setLinked(null);
+      setAccounts([]);
+      setCliStatus({ installed: true, authenticated: false });
+      showToast('Signed out of Cloudflare.', 'success');
+    } catch {
+      showToast('Failed to sign out.', 'error');
+    }
+  }, [shell, storage, showToast]);
+
   const handleLinked = useCallback((project: LinkedProject) => {
     setLinked(project);
   }, []);
@@ -1392,6 +1417,43 @@ function CloudflareToolbar() {
           <CloudflareIcon />
           Connect Cloudflare
         </button>
+      );
+
+    case 'WRONG_ACCOUNT':
+      return (
+        <div
+          className="cf-dropdown-wrapper"
+          ref={dropdownRef}
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={handleMouseLeave}
+        >
+          <button
+            className="toolbar-icon-btn"
+            onClick={handleLogin}
+            title={`This project is linked to account "${linked?.accountName}". Sign in to that account to deploy.`}
+            style={{ color: '#F6821F' }}
+          >
+            <CloudflareIcon />
+            Wrong Account
+          </button>
+          {showDropdown && (
+            <div className="cf-dropdown" style={{ background: theme.bgPrimary, border: `1px solid ${theme.border}` }}>
+              <div style={{ padding: '8px 12px', fontSize: 11, opacity: 0.5 }}>
+                Linked to: {linked?.accountName || 'unknown account'}
+              </div>
+              <div className="cf-dropdown-divider" style={{ background: theme.border }} />
+              <button className="cf-dropdown-item" onClick={handleLogin}>
+                Sign In
+              </button>
+              <button className="cf-dropdown-item" onClick={handleUnlink}>
+                Disconnect Project
+              </button>
+              <button className="cf-dropdown-item" onClick={handleSignOut} style={{ color: theme.error }}>
+                Sign Out
+              </button>
+            </div>
+          )}
+        </div>
       );
 
     case 'NOT_LINKED':
@@ -1457,6 +1519,7 @@ function CloudflareToolbar() {
               showToast={showToast}
               storage={storage}
               onUnlink={handleUnlink}
+              onSignOut={handleSignOut}
               onDeploy={handleDeploy}
               isDeploying={isDeploying}
             />
