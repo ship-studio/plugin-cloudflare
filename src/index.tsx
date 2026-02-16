@@ -17,69 +17,157 @@ const CF_STYLE_ID = 'cf-plugin-styles';
 const CLOUDFLARE_CSS = `
 @keyframes cfPulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
+  50% { opacity: 0.5; }
 }
 
-.cf-pulsing {
+.cf-checking {
+  cursor: wait;
+}
+
+.cf-checking .cf-checking-text {
   animation: cfPulse 1.5s ease-in-out infinite;
 }
 
 .cf-deploying {
   color: #F6821F !important;
+  cursor: wait;
+}
+
+.cf-deploying .cf-deploying-text {
   animation: cfPulse 1.5s ease-in-out infinite;
 }
 
 /* Dropdown */
 .cf-dropdown-wrapper {
   position: relative;
-  display: inline-block;
 }
 
 .cf-dropdown {
   position: absolute;
-  top: calc(100% + 4px);
+  top: 100%;
   right: 0;
-  min-width: 220px;
-  border-radius: 8px;
-  overflow: hidden;
-  z-index: 9999;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  padding-top: 4px;
+  z-index: 100;
 }
 
-.cf-dropdown-item {
+.cf-dropdown-inner {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 200px;
+  max-width: 320px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.cf-dropdown-inner button {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  font-size: 12px;
-  cursor: pointer;
-  border: none;
-  background: transparent;
-  color: inherit;
   width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 6px;
   text-align: left;
-  text-decoration: none;
 }
 
-.cf-dropdown-item:hover {
-  background: var(--bg-tertiary, rgba(255,255,255,0.05));
-  border-radius: 0;
+.cf-dropdown-inner button:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.cf-dropdown-inner button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cf-dropdown-inner button svg {
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+
+.cf-dropdown-inner button:hover svg {
+  opacity: 1;
+}
+
+.cf-site-url {
+  flex: 1;
+  min-width: 0;
+  font-family: monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cf-dropdown-divider {
   height: 1px;
-  margin: 0;
+  background: var(--border);
+  margin: 4px 0;
 }
 
 .cf-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 6px;
-  border-radius: 4px;
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.cf-badge-prod {
+  color: rgba(74, 222, 128, 0.9);
+  background: rgba(74, 222, 128, 0.12);
+}
+
+.cf-badge-dashboard {
+  color: rgba(251, 191, 36, 0.9);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+/* Dropdown action items (smaller, muted) */
+.cf-dropdown-action {
+  color: var(--text-muted) !important;
+  font-size: 12px !important;
+  padding: 8px 12px !important;
+  gap: 6px !important;
+}
+
+.cf-dropdown-action:hover {
+  color: var(--text-secondary) !important;
+}
+
+.cf-dropdown-action svg {
+  opacity: 0.6;
+}
+
+.cf-dropdown-action:hover svg {
+  opacity: 1;
+}
+
+.cf-dropdown-action.cf-action-danger:hover {
+  color: var(--error, #ef4444) !important;
+}
+
+.cf-dropdown-action.cf-action-danger:hover svg {
+  color: var(--error, #ef4444);
+}
+
+/* Account mismatch */
+.cf-mismatch-text {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.cf-mismatch-text strong {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 /* Modal — fully self-contained, no host class dependencies */
@@ -569,6 +657,54 @@ function ExternalLinkIcon({ size = 12 }: { size?: number }) {
   );
 }
 
+function SwitchIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="17 1 21 5 17 9" />
+      <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+      <polyline points="7 23 3 19 7 15" />
+      <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+    </svg>
+  );
+}
+
+function DisconnectIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function DeployIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="16 16 12 12 8 16" />
+      <line x1="12" y1="12" x2="12" y2="21" />
+      <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3" />
+    </svg>
+  );
+}
+
+function AutoDeployIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+    </svg>
+  );
+}
+
+function SignOutIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" />
+      <line x1="21" y1="12" x2="9" y2="12" />
+    </svg>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Connect Modal
 // ---------------------------------------------------------------------------
@@ -980,22 +1116,14 @@ function ConnectModal({
 
 function ConnectedDropdown({
   linked,
-  theme,
   actions,
-  shell,
-  showToast,
-  storage,
   onUnlink,
   onSignOut,
   onDeploy,
   isDeploying,
 }: {
   linked: LinkedProject;
-  theme: PluginContextValue['theme'];
   actions: PluginContextValue['actions'];
-  shell: PluginContextValue['shell'];
-  showToast: PluginContextValue['actions']['showToast'];
-  storage: PluginContextValue['storage'];
   onUnlink: () => void;
   onSignOut: () => void;
   onDeploy: () => void;
@@ -1006,73 +1134,67 @@ function ConnectedDropdown({
   const prodLabel = prodUrl.replace('https://', '');
 
   return (
-    <div className="cf-dropdown" style={{ background: theme.bgPrimary, border: `1px solid ${theme.border}` }}>
-      {/* Prod URL */}
-      <button
-        className="cf-dropdown-item"
-        onClick={() => actions.openUrl(prodUrl)}
-      >
-        <span className="cf-badge" style={{ background: 'rgba(246, 130, 31, 0.15)', color: '#F6821F' }}>
-          PROD
-        </span>
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {prodLabel}
-        </span>
-        <ExternalLinkIcon />
-      </button>
+    <div className="cf-dropdown">
+      <div className="cf-dropdown-inner">
+        {/* Prod URL */}
+        <button
+          onClick={(e) => { e.stopPropagation(); actions.openUrl(prodUrl); }}
+        >
+          <span className="cf-badge cf-badge-prod">Prod</span>
+          <span className="cf-site-url">{prodLabel}</span>
+          <ExternalLinkIcon />
+        </button>
 
-      <div className="cf-dropdown-divider" style={{ background: theme.border }} />
+        {/* Dashboard */}
+        <button
+          onClick={(e) => { e.stopPropagation(); actions.openUrl(dashboardUrl); }}
+        >
+          <span className="cf-badge cf-badge-dashboard">Dash</span>
+          <span className="cf-site-url">dash.cloudflare.com</span>
+          <ExternalLinkIcon />
+        </button>
 
-      {/* Dashboard */}
-      <button
-        className="cf-dropdown-item"
-        onClick={() => actions.openUrl(dashboardUrl)}
-      >
-        Dashboard
-        <ExternalLinkIcon />
-      </button>
+        <div className="cf-dropdown-divider" />
 
-      {/* Deploy */}
-      <button
-        className="cf-dropdown-item"
-        onClick={onDeploy}
-        disabled={isDeploying}
-        style={isDeploying ? { opacity: 0.5, cursor: 'not-allowed' } : undefined}
-      >
-        {isDeploying ? (
-          <><span className="cf-spinner" /> Deploying...</>
-        ) : (
-          'Deploy Now'
-        )}
-      </button>
+        {/* Deploy */}
+        <button
+          className="cf-dropdown-action"
+          onClick={(e) => { e.stopPropagation(); onDeploy(); }}
+          disabled={isDeploying}
+        >
+          <DeployIcon />
+          {isDeploying ? 'Deploying...' : 'Deploy Now'}
+        </button>
 
-      {/* Auto-deploy via Cloudflare Git integration */}
-      <button
-        className="cf-dropdown-item"
-        onClick={() => openAutoDeploySetup(actions, linked.accountId)}
-      >
-        Enable Auto-Deploy
-        <ExternalLinkIcon />
-      </button>
+        {/* Auto-deploy */}
+        <button
+          className="cf-dropdown-action"
+          onClick={(e) => { e.stopPropagation(); openAutoDeploySetup(actions, linked.accountId); }}
+        >
+          <AutoDeployIcon />
+          Enable Auto-Deploy
+        </button>
 
-      <div className="cf-dropdown-divider" style={{ background: theme.border }} />
+        <div className="cf-dropdown-divider" />
 
-      {/* Unlink */}
-      <button
-        className="cf-dropdown-item"
-        onClick={onUnlink}
-      >
-        Disconnect Project
-      </button>
+        {/* Disconnect */}
+        <button
+          className="cf-dropdown-action cf-action-danger"
+          onClick={(e) => { e.stopPropagation(); onUnlink(); }}
+        >
+          <DisconnectIcon />
+          Disconnect Project
+        </button>
 
-      {/* Sign out */}
-      <button
-        className="cf-dropdown-item"
-        onClick={onSignOut}
-        style={{ color: theme.error }}
-      >
-        Sign Out
-      </button>
+        {/* Sign out */}
+        <button
+          className="cf-dropdown-action cf-action-danger"
+          onClick={(e) => { e.stopPropagation(); onSignOut(); }}
+        >
+          <SignOutIcon />
+          Sign Out
+        </button>
+      </div>
     </div>
   );
 }
@@ -1385,12 +1507,12 @@ function CloudflareToolbar() {
     case 'CHECKING':
       return (
         <button
-          className="toolbar-icon-btn cf-pulsing"
+          className="toolbar-icon-btn cf-checking"
           disabled
           title="Connecting to Cloudflare..."
         >
           <CloudflareIcon />
-          Connecting...
+          <span className="cf-checking-text">Connecting...</span>
         </button>
       );
 
@@ -1429,28 +1551,34 @@ function CloudflareToolbar() {
         >
           <button
             className="toolbar-icon-btn"
-            onClick={handleLogin}
-            title={`This project is linked to account "${linked?.accountName}". Sign in to that account to deploy.`}
-            style={{ color: '#F6821F' }}
+            onClick={() => setShowDropdown((v) => !v)}
+            title="Account mismatch"
+            style={{ color: '#f59e0b' }}
           >
             <CloudflareIcon />
-            Wrong Account
           </button>
           {showDropdown && (
-            <div className="cf-dropdown" style={{ background: theme.bgPrimary, border: `1px solid ${theme.border}` }}>
-              <div style={{ padding: '8px 12px', fontSize: 11, opacity: 0.5 }}>
-                Linked to: {linked?.accountName || 'unknown account'}
+            <div className="cf-dropdown">
+              <div className="cf-dropdown-inner">
+                <div className="cf-mismatch-text">
+                  This project is linked to <strong>{linked?.accountName || 'a different account'}</strong> but you&apos;re signed in to a different account.
+                </div>
+                <div className="cf-dropdown-divider" />
+                <button
+                  className="cf-dropdown-action"
+                  onClick={(e) => { e.stopPropagation(); handleLogin(); }}
+                >
+                  <SwitchIcon />
+                  Switch Account
+                </button>
+                <button
+                  className="cf-dropdown-action cf-action-danger"
+                  onClick={(e) => { e.stopPropagation(); handleUnlink(); }}
+                >
+                  <DisconnectIcon />
+                  Disconnect Project
+                </button>
               </div>
-              <div className="cf-dropdown-divider" style={{ background: theme.border }} />
-              <button className="cf-dropdown-item" onClick={handleLogin}>
-                Sign In
-              </button>
-              <button className="cf-dropdown-item" onClick={handleUnlink}>
-                Disconnect Project
-              </button>
-              <button className="cf-dropdown-item" onClick={handleSignOut} style={{ color: theme.error }}>
-                Sign Out
-              </button>
             </div>
           )}
         </div>
@@ -1491,7 +1619,7 @@ function CloudflareToolbar() {
           title="Deploying to Cloudflare Pages..."
         >
           <CloudflareIcon />
-          Deploying...
+          <span className="cf-deploying-text">Deploying...</span>
         </button>
       );
 
@@ -1501,7 +1629,7 @@ function CloudflareToolbar() {
           className="cf-dropdown-wrapper"
           ref={dropdownRef}
           onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
+          onMouseLeave={() => !isDeploying && handleMouseLeave()}
         >
           <button
             className="toolbar-icon-btn"
@@ -1513,11 +1641,7 @@ function CloudflareToolbar() {
           {showDropdown && (
             <ConnectedDropdown
               linked={linked!}
-              theme={theme}
               actions={actions}
-              shell={shell}
-              showToast={showToast}
-              storage={storage}
               onUnlink={handleUnlink}
               onSignOut={handleSignOut}
               onDeploy={handleDeploy}
