@@ -543,6 +543,93 @@ function useAppActions() { return usePluginContext().actions; }
 function useTheme() { return usePluginContext().theme; }
 
 // ---------------------------------------------------------------------------
+// Cross-platform shell helpers
+// ---------------------------------------------------------------------------
+// Ship Studio's shell.exec() spawns commands directly without a shell, so on
+// Windows POSIX tools (`cat`, `test`, `sh`, `rm`) don't exist on PATH and
+// npm-installed CLIs (npm, npx) are .cmd shims that don't resolve. Route those
+// through cmd.exe / Node instead — same approach as the fix shipped in
+// plugin-vercel (commit b0a23cc).
+
+const IS_WINDOWS =
+  typeof navigator !== 'undefined' &&
+  (/Windows/i.test(navigator.userAgent || '') ||
+    /Win/i.test((navigator as { platform?: string }).platform || ''));
+
+// CLIs installed as .cmd shims (npm global bins) — the shell must resolve
+// these on Windows; spawning the bare name returns ENOENT.
+const WIN_SHIM_TOOLS = new Set(['npm', 'npx', 'wrangler', 'yarn', 'pnpm']);
+
+type Shell = PluginContextValue['shell'];
+type ExecOptions = { timeout?: number };
+type ExecResult = { stdout: string; stderr: string; exit_code: number };
+
+// Quote an argument for cmd.exe: wrap when it contains whitespace or cmd
+// metacharacters, doubling any embedded quotes.
+function quoteForCmd(arg: string): string {
+  if (arg === '' || /[\s"&|<>^()%]/.test(arg)) {
+    return '"' + arg.replace(/"/g, '""') + '"';
+  }
+  return arg;
+}
+
+// Quote an argument for sh.
+function quoteForSh(arg: string): string {
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
+// Direct tool invocation that resolves Windows .cmd shims when needed. Real
+// executables (git, node) are spawned directly on every platform.
+function execTool(
+  shell: Shell,
+  command: string,
+  args: string[],
+  options?: ExecOptions
+): Promise<ExecResult> {
+  if (IS_WINDOWS && WIN_SHIM_TOOLS.has(command)) {
+    const line = [command, ...args].map(quoteForCmd).join(' ');
+    return shell.exec('cmd', ['/c', line], options);
+  }
+  return shell.exec(command, args, options);
+}
+
+// Run a tool with extra environment variables. POSIX `VAR=x cmd` prefixes
+// don't exist in cmd.exe, so on Windows this becomes `cmd /c "set VAR=x&& …"`.
+function execToolWithEnv(
+  shell: Shell,
+  env: Record<string, string>,
+  command: string,
+  args: string[],
+  options?: ExecOptions
+): Promise<ExecResult> {
+  if (IS_WINDOWS) {
+    const sets = Object.entries(env)
+      .map(([k, v]) => `set ${k}=${v}&& `)
+      .join('');
+    const line = sets + [command, ...args].map(quoteForCmd).join(' ');
+    return shell.exec('cmd', ['/c', line], options);
+  }
+  const prefix = Object.entries(env)
+    .map(([k, v]) => `${k}=${quoteForSh(v)} `)
+    .join('');
+  const line = prefix + [command, ...args].map(quoteForSh).join(' ');
+  return shell.exec('sh', ['-c', line], options);
+}
+
+// Read a UTF-8 file via Node (cross-platform replacement for `cat`). exit_code
+// is 1 when the file is missing, matching the previous `cat` behavior.
+function readFile(shell: Shell, path: string, options?: ExecOptions): Promise<ExecResult> {
+  const script = `try{process.stdout.write(require('fs').readFileSync(process.argv[1],'utf8'))}catch(e){process.exit(1)}`;
+  return shell.exec('node', ['-e', script, path], options ?? { timeout: 10 });
+}
+
+// Directory-existence check via Node (cross-platform replacement for `test -d`).
+function dirExists(shell: Shell, path: string, options?: ExecOptions): Promise<ExecResult> {
+  const script = `process.exit(require('fs').statSync(process.argv[1],{throwIfNoEntry:false})?.isDirectory()?0:1)`;
+  return shell.exec('node', ['-e', script, path], options ?? { timeout: 10 });
+}
+
+// ---------------------------------------------------------------------------
 // Domain Types
 // ---------------------------------------------------------------------------
 
@@ -602,7 +689,7 @@ async function detectOutputDir(
 ): Promise<string> {
   // Check package.json for framework hints first — most reliable
   try {
-    const result = await shell.exec('cat', ['package.json']);
+    const result = await readFile(shell, 'package.json', { timeout: 10 });
     if (result.exit_code === 0) {
       const pkg = result.stdout.toLowerCase();
       if (pkg.includes('"next"') || pkg.includes("'next'")) return 'out';
@@ -619,7 +706,7 @@ async function detectOutputDir(
   const candidates = ['dist', 'build', 'out', 'public'];
   for (const dir of candidates) {
     try {
-      const result = await shell.exec('test', ['-d', dir]);
+      const result = await dirExists(shell, dir, { timeout: 10 });
       if (result.exit_code === 0) return dir;
     } catch {
       // ignore
@@ -767,8 +854,13 @@ function ConnectModal({
     setExistingProjects([]);
     setSelectedExisting(null);
 
-    shell
-      .exec('sh', ['-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project list`])
+    execToolWithEnv(
+      shell,
+      { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+      'npx',
+      ['--yes', 'wrangler', 'pages', 'project', 'list'],
+      { timeout: 30 }
+    )
       .then((result) => {
         if (cancelled) return;
         if (result.exit_code === 0) {
@@ -816,9 +908,13 @@ function ConnectModal({
 
     try {
       // Create the project
-      const createResult = await shell.exec('sh', [
-        '-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project create ${sanitized} --production-branch main`,
-      ]);
+      const createResult = await execToolWithEnv(
+        shell,
+        { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+        'npx',
+        ['--yes', 'wrangler', 'pages', 'project', 'create', sanitized, '--production-branch', 'main'],
+        { timeout: 60 }
+      );
 
       if (createResult.exit_code !== 0) {
         const stderr = createResult.stderr || '';
@@ -842,7 +938,8 @@ function ConnectModal({
 
       // Build then deploy
       try {
-        const buildResult = await shell.exec('npm', ['run', 'build'], { timeout: 300000 });
+        // timeout is in seconds (300000 read as ms would clamp to the 600s ceiling)
+        const buildResult = await execTool(shell, 'npm', ['run', 'build'], { timeout: 300 });
         if (buildResult.exit_code !== 0) {
           setError(`Build failed: ${buildResult.stderr || buildResult.stdout}`);
           setLoading(false);
@@ -850,17 +947,19 @@ function ConnectModal({
         }
 
         // Verify output directory exists
-        const dirCheck = await shell.exec('test', ['-d', outputDir]);
+        const dirCheck = await dirExists(shell, outputDir, { timeout: 10 });
         if (dirCheck.exit_code !== 0) {
           setError(`Build succeeded but "${outputDir}" folder was not created. Check your framework's output settings — for Next.js, add \`output: 'export'\` to next.config.`);
           setLoading(false);
           return;
         }
 
-        const deployResult = await shell.exec(
-          'sh',
-          ['-c', `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages deploy ${outputDir} --project-name ${sanitized}`],
-          { timeout: 300000 }
+        const deployResult = await execToolWithEnv(
+          shell,
+          { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+          'npx',
+          ['--yes', 'wrangler', 'pages', 'deploy', outputDir, '--project-name', sanitized],
+          { timeout: 300 }
         );
         // Parse the real URL from deploy output (e.g. "https://abc123.my-project.pages.dev")
         const urlMatch = (deployResult.stdout + '\n' + deployResult.stderr).match(/https:\/\/[^\s]*\.pages\.dev/);
@@ -1248,14 +1347,20 @@ function CloudflareToolbar() {
 
     async function check() {
       try {
-        // Step 1: Run whoami --json, redirect to temp file
-        const writeResult = await shell.exec('sh', [
-          '-c', 'npx --yes wrangler whoami --json > /tmp/cf_whoami.json 2>/dev/null'
-        ], { timeout: 30000 });
+        // Single whoami --json call. shell.exec captures stdout/stderr
+        // separately, so no temp-file redirect is needed — the previous
+        // `sh -c '… > /tmp/cf_whoami.json'` + `cat` + `rm` dance broke on
+        // Windows (no sh/cat/rm on PATH, no /tmp).
+        const whoamiResult = await execTool(
+          shell,
+          'npx',
+          ['--yes', 'wrangler', 'whoami', '--json'],
+          { timeout: 30 }
+        );
         if (cancelled) return;
 
-        if (writeResult.exit_code !== 0) {
-          const combined = (writeResult.stderr + writeResult.stdout).toLowerCase();
+        if (whoamiResult.exit_code !== 0) {
+          const combined = (whoamiResult.stderr + whoamiResult.stdout).toLowerCase();
           if (combined.includes('not found') || combined.includes('enoent') || combined.includes('err_module')) {
             setCliStatus({ installed: false, authenticated: false });
           } else {
@@ -1264,18 +1369,12 @@ function CloudflareToolbar() {
           return;
         }
 
-        // Step 2: Read the unsanitized file back
-        const readResult = await shell.exec('cat', ['/tmp/cf_whoami.json']);
-
-        // Step 3: Clean up
-        shell.exec('rm', ['-f', '/tmp/cf_whoami.json']);
-
-        if (readResult.exit_code !== 0 || !readResult.stdout.trim()) {
+        if (!whoamiResult.stdout.trim()) {
           setCliStatus({ installed: true, authenticated: false });
           return;
         }
 
-        const parsedAccounts = parseWhoamiJson(readResult.stdout);
+        const parsedAccounts = parseWhoamiJson(whoamiResult.stdout);
         setAccounts(parsedAccounts);
         setCliStatus({ installed: true, authenticated: parsedAccounts.length > 0 });
 
@@ -1288,9 +1387,13 @@ function CloudflareToolbar() {
               // Backfill prodUrl if missing (old stored data)
               if (!linkedData.prodUrl) {
                 try {
-                  const listResult = await shell.exec('sh', [
-                    '-c', `CLOUDFLARE_ACCOUNT_ID=${linkedData.accountId} npx --yes wrangler pages project list`
-                  ]);
+                  const listResult = await execToolWithEnv(
+                    shell,
+                    { CLOUDFLARE_ACCOUNT_ID: linkedData.accountId },
+                    'npx',
+                    ['--yes', 'wrangler', 'pages', 'project', 'list'],
+                    { timeout: 30 }
+                  );
                   if (listResult.exit_code === 0) {
                     const projects = parseProjectList(listResult.stdout);
                     const match = projects.find((p) => p.name === linkedData.projectName);
@@ -1329,7 +1432,7 @@ function CloudflareToolbar() {
 
     async function checkRemote() {
       try {
-        const result = await shell.exec('git', ['remote', '-v']);
+        const result = await shell.exec('git', ['remote', '-v'], { timeout: 10 });
         if (!cancelled && result.exit_code === 0 && result.stdout.trim()) {
           setHasGitRemote(true);
         }
@@ -1359,16 +1462,17 @@ function CloudflareToolbar() {
     setInstalling(true);
     showToast('Installing wrangler globally...', 'success');
     try {
-      // Try npm global install first
-      let result = await shell.exec('npm', ['install', '-g', 'wrangler'], { timeout: 120000 });
+      // Try npm global install first. Timeouts are in seconds — the previous
+      // 120000 'ms-style' values clamped to the backend's 600s ceiling.
+      let result = await execTool(shell, 'npm', ['install', '-g', 'wrangler'], { timeout: 600 });
       if (result.exit_code !== 0) {
         // Fallback: install as project devDependency
         showToast('Global install failed, trying local install...', 'success');
-        result = await shell.exec('npm', ['install', '--save-dev', 'wrangler'], { timeout: 120000 });
+        result = await execTool(shell, 'npm', ['install', '--save-dev', 'wrangler'], { timeout: 600 });
       }
       if (result.exit_code === 0) {
         // Verify it's actually available now
-        const check = await shell.exec('npx', ['--yes', 'wrangler', '--version']);
+        const check = await execTool(shell, 'npx', ['--yes', 'wrangler', '--version'], { timeout: 15 });
         if (check.exit_code === 0) {
           showToast('Wrangler installed!', 'success');
           setCliStatus({ installed: true, authenticated: false });
@@ -1388,17 +1492,18 @@ function CloudflareToolbar() {
   const handleLogin = useCallback(async () => {
     showToast('Opening Cloudflare login...', 'success');
     try {
-      const result = await shell.exec('npx', ['--yes', 'wrangler', 'login'], { timeout: 120000 });
+      const result = await execTool(shell, 'npx', ['--yes', 'wrangler', 'login'], { timeout: 120 });
       if (result.exit_code === 0) {
-        // Re-check whoami with --json via temp file
-        await shell.exec('sh', [
-          '-c', 'npx --yes wrangler whoami --json > /tmp/cf_whoami.json 2>/dev/null'
-        ], { timeout: 30000 });
-        const readResult = await shell.exec('cat', ['/tmp/cf_whoami.json']);
-        shell.exec('rm', ['-f', '/tmp/cf_whoami.json']);
+        // Re-check whoami with --json (direct call — see the mount check)
+        const whoamiResult = await execTool(
+          shell,
+          'npx',
+          ['--yes', 'wrangler', 'whoami', '--json'],
+          { timeout: 30 }
+        );
 
-        if (readResult.exit_code === 0 && readResult.stdout.trim()) {
-          const parsedAccounts = parseWhoamiJson(readResult.stdout);
+        if (whoamiResult.exit_code === 0 && whoamiResult.stdout.trim()) {
+          const parsedAccounts = parseWhoamiJson(whoamiResult.stdout);
           setAccounts(parsedAccounts);
           if (parsedAccounts.length > 0) {
             setCliStatus({ installed: true, authenticated: true });
@@ -1423,7 +1528,8 @@ function CloudflareToolbar() {
 
     try {
       showToast('Building project...', 'success');
-      const buildResult = await shell.exec('npm', ['run', 'build'], { timeout: 300000 });
+      // timeout is in seconds (300000 read as ms would clamp to the 600s ceiling)
+      const buildResult = await execTool(shell, 'npm', ['run', 'build'], { timeout: 300 });
       if (buildResult.exit_code !== 0) {
         showToast(`Build failed: ${buildResult.stderr || buildResult.stdout}`, 'error');
         setIsDeploying(false);
@@ -1431,17 +1537,19 @@ function CloudflareToolbar() {
       }
 
       // Verify output directory exists
-      const dirCheck = await shell.exec('test', ['-d', linked.outputDir]);
+      const dirCheck = await dirExists(shell, linked.outputDir, { timeout: 10 });
       if (dirCheck.exit_code !== 0) {
         showToast(`Build succeeded but "${linked.outputDir}" folder not found. Check your framework's output settings.`, 'error');
         setIsDeploying(false);
         return;
       }
 
-      const result = await shell.exec(
-        'sh',
-        ['-c', `CLOUDFLARE_ACCOUNT_ID=${linked.accountId} npx --yes wrangler pages deploy ${linked.outputDir} --project-name ${linked.projectName}`],
-        { timeout: 300000 }
+      const result = await execToolWithEnv(
+        shell,
+        { CLOUDFLARE_ACCOUNT_ID: linked.accountId },
+        'npx',
+        ['--yes', 'wrangler', 'pages', 'deploy', linked.outputDir, '--project-name', linked.projectName],
+        { timeout: 300 }
       );
       if (result.exit_code === 0) {
         // Update prodUrl if we can parse it from deploy output
@@ -1480,7 +1588,7 @@ function CloudflareToolbar() {
   const handleSignOut = useCallback(async () => {
     setShowDropdown(false);
     try {
-      await shell.exec('npx', ['--yes', 'wrangler', 'logout'], { timeout: 30000 });
+      await execTool(shell, 'npx', ['--yes', 'wrangler', 'logout'], { timeout: 30 });
       await storage.write({});
       setLinked(null);
       setAccounts([]);

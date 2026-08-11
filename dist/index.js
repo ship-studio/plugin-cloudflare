@@ -464,6 +464,42 @@ function usePluginContext() {
   if (directCtx) return directCtx;
   throw new Error("Plugin context not available.");
 }
+const IS_WINDOWS = typeof navigator !== "undefined" && (/Windows/i.test(navigator.userAgent || "") || /Win/i.test(navigator.platform || ""));
+const WIN_SHIM_TOOLS = /* @__PURE__ */ new Set(["npm", "npx", "wrangler", "yarn", "pnpm"]);
+function quoteForCmd(arg) {
+  if (arg === "" || /[\s"&|<>^()%]/.test(arg)) {
+    return '"' + arg.replace(/"/g, '""') + '"';
+  }
+  return arg;
+}
+function quoteForSh(arg) {
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+function execTool(shell, command, args, options) {
+  if (IS_WINDOWS && WIN_SHIM_TOOLS.has(command)) {
+    const line = [command, ...args].map(quoteForCmd).join(" ");
+    return shell.exec("cmd", ["/c", line], options);
+  }
+  return shell.exec(command, args, options);
+}
+function execToolWithEnv(shell, env, command, args, options) {
+  if (IS_WINDOWS) {
+    const sets = Object.entries(env).map(([k, v]) => `set ${k}=${v}&& `).join("");
+    const line2 = sets + [command, ...args].map(quoteForCmd).join(" ");
+    return shell.exec("cmd", ["/c", line2], options);
+  }
+  const prefix = Object.entries(env).map(([k, v]) => `${k}=${quoteForSh(v)} `).join("");
+  const line = prefix + [command, ...args].map(quoteForSh).join(" ");
+  return shell.exec("sh", ["-c", line], options);
+}
+function readFile(shell, path, options) {
+  const script = `try{process.stdout.write(require('fs').readFileSync(process.argv[1],'utf8'))}catch(e){process.exit(1)}`;
+  return shell.exec("node", ["-e", script, path], options ?? { timeout: 10 });
+}
+function dirExists(shell, path, options) {
+  const script = `process.exit(require('fs').statSync(process.argv[1],{throwIfNoEntry:false})?.isDirectory()?0:1)`;
+  return shell.exec("node", ["-e", script, path], options ?? { timeout: 10 });
+}
 function parseWhoamiJson(jsonStr) {
   try {
     const data = JSON.parse(jsonStr);
@@ -486,7 +522,7 @@ function parseProjectList(stdout) {
 }
 async function detectOutputDir(shell) {
   try {
-    const result = await shell.exec("cat", ["package.json"]);
+    const result = await readFile(shell, "package.json", { timeout: 10 });
     if (result.exit_code === 0) {
       const pkg = result.stdout.toLowerCase();
       if (pkg.includes('"next"') || pkg.includes("'next'")) return "out";
@@ -500,7 +536,7 @@ async function detectOutputDir(shell) {
   const candidates = ["dist", "build", "out", "public"];
   for (const dir of candidates) {
     try {
-      const result = await shell.exec("test", ["-d", dir]);
+      const result = await dirExists(shell, dir, { timeout: 10 });
       if (result.exit_code === 0) return dir;
     } catch {
     }
@@ -593,7 +629,13 @@ function ConnectModal({
     setLoadingProjects(true);
     setExistingProjects([]);
     setSelectedExisting(null);
-    shell.exec("sh", ["-c", `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project list`]).then((result) => {
+    execToolWithEnv(
+      shell,
+      { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+      "npx",
+      ["--yes", "wrangler", "pages", "project", "list"],
+      { timeout: 30 }
+    ).then((result) => {
       if (cancelled) return;
       if (result.exit_code === 0) {
         setExistingProjects(parseProjectList(result.stdout));
@@ -632,10 +674,13 @@ function ConnectModal({
     setError(null);
     setLoading(true);
     try {
-      const createResult = await shell.exec("sh", [
-        "-c",
-        `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages project create ${sanitized} --production-branch main`
-      ]);
+      const createResult = await execToolWithEnv(
+        shell,
+        { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+        "npx",
+        ["--yes", "wrangler", "pages", "project", "create", sanitized, "--production-branch", "main"],
+        { timeout: 60 }
+      );
       if (createResult.exit_code !== 0) {
         const stderr = createResult.stderr || "";
         if (!stderr.toLowerCase().includes("already exists")) {
@@ -653,22 +698,24 @@ function ConnectModal({
       };
       await storage.write(linked);
       try {
-        const buildResult = await shell.exec("npm", ["run", "build"], { timeout: 3e5 });
+        const buildResult = await execTool(shell, "npm", ["run", "build"], { timeout: 300 });
         if (buildResult.exit_code !== 0) {
           setError(`Build failed: ${buildResult.stderr || buildResult.stdout}`);
           setLoading(false);
           return;
         }
-        const dirCheck = await shell.exec("test", ["-d", outputDir]);
+        const dirCheck = await dirExists(shell, outputDir, { timeout: 10 });
         if (dirCheck.exit_code !== 0) {
           setError(`Build succeeded but "${outputDir}" folder was not created. Check your framework's output settings — for Next.js, add \`output: 'export'\` to next.config.`);
           setLoading(false);
           return;
         }
-        const deployResult = await shell.exec(
-          "sh",
-          ["-c", `CLOUDFLARE_ACCOUNT_ID=${selectedAccountId} npx --yes wrangler pages deploy ${outputDir} --project-name ${sanitized}`],
-          { timeout: 3e5 }
+        const deployResult = await execToolWithEnv(
+          shell,
+          { CLOUDFLARE_ACCOUNT_ID: selectedAccountId },
+          "npx",
+          ["--yes", "wrangler", "pages", "deploy", outputDir, "--project-name", sanitized],
+          { timeout: 300 }
         );
         const urlMatch = (deployResult.stdout + "\n" + deployResult.stderr).match(/https:\/\/[^\s]*\.pages\.dev/);
         if (urlMatch) {
@@ -1039,13 +1086,15 @@ function CloudflareToolbar() {
     let cancelled = false;
     async function check() {
       try {
-        const writeResult = await shell.exec("sh", [
-          "-c",
-          "npx --yes wrangler whoami --json > /tmp/cf_whoami.json 2>/dev/null"
-        ], { timeout: 3e4 });
+        const whoamiResult = await execTool(
+          shell,
+          "npx",
+          ["--yes", "wrangler", "whoami", "--json"],
+          { timeout: 30 }
+        );
         if (cancelled) return;
-        if (writeResult.exit_code !== 0) {
-          const combined = (writeResult.stderr + writeResult.stdout).toLowerCase();
+        if (whoamiResult.exit_code !== 0) {
+          const combined = (whoamiResult.stderr + whoamiResult.stdout).toLowerCase();
           if (combined.includes("not found") || combined.includes("enoent") || combined.includes("err_module")) {
             setCliStatus({ installed: false, authenticated: false });
           } else {
@@ -1053,13 +1102,11 @@ function CloudflareToolbar() {
           }
           return;
         }
-        const readResult = await shell.exec("cat", ["/tmp/cf_whoami.json"]);
-        shell.exec("rm", ["-f", "/tmp/cf_whoami.json"]);
-        if (readResult.exit_code !== 0 || !readResult.stdout.trim()) {
+        if (!whoamiResult.stdout.trim()) {
           setCliStatus({ installed: true, authenticated: false });
           return;
         }
-        const parsedAccounts = parseWhoamiJson(readResult.stdout);
+        const parsedAccounts = parseWhoamiJson(whoamiResult.stdout);
         setAccounts(parsedAccounts);
         setCliStatus({ installed: true, authenticated: parsedAccounts.length > 0 });
         if (parsedAccounts.length > 0) {
@@ -1069,10 +1116,13 @@ function CloudflareToolbar() {
               const linkedData = data;
               if (!linkedData.prodUrl) {
                 try {
-                  const listResult = await shell.exec("sh", [
-                    "-c",
-                    `CLOUDFLARE_ACCOUNT_ID=${linkedData.accountId} npx --yes wrangler pages project list`
-                  ]);
+                  const listResult = await execToolWithEnv(
+                    shell,
+                    { CLOUDFLARE_ACCOUNT_ID: linkedData.accountId },
+                    "npx",
+                    ["--yes", "wrangler", "pages", "project", "list"],
+                    { timeout: 30 }
+                  );
                   if (listResult.exit_code === 0) {
                     const projects = parseProjectList(listResult.stdout);
                     const match = projects.find((p) => p.name === linkedData.projectName);
@@ -1105,7 +1155,7 @@ function CloudflareToolbar() {
     let cancelled = false;
     async function checkRemote() {
       try {
-        const result = await shell.exec("git", ["remote", "-v"]);
+        const result = await shell.exec("git", ["remote", "-v"], { timeout: 10 });
         if (!cancelled && result.exit_code === 0 && result.stdout.trim()) {
           setHasGitRemote(true);
         }
@@ -1133,13 +1183,13 @@ function CloudflareToolbar() {
     setInstalling(true);
     showToast("Installing wrangler globally...", "success");
     try {
-      let result = await shell.exec("npm", ["install", "-g", "wrangler"], { timeout: 12e4 });
+      let result = await execTool(shell, "npm", ["install", "-g", "wrangler"], { timeout: 600 });
       if (result.exit_code !== 0) {
         showToast("Global install failed, trying local install...", "success");
-        result = await shell.exec("npm", ["install", "--save-dev", "wrangler"], { timeout: 12e4 });
+        result = await execTool(shell, "npm", ["install", "--save-dev", "wrangler"], { timeout: 600 });
       }
       if (result.exit_code === 0) {
-        const check = await shell.exec("npx", ["--yes", "wrangler", "--version"]);
+        const check = await execTool(shell, "npx", ["--yes", "wrangler", "--version"], { timeout: 15 });
         if (check.exit_code === 0) {
           showToast("Wrangler installed!", "success");
           setCliStatus({ installed: true, authenticated: false });
@@ -1158,16 +1208,16 @@ function CloudflareToolbar() {
   const handleLogin = useCallback(async () => {
     showToast("Opening Cloudflare login...", "success");
     try {
-      const result = await shell.exec("npx", ["--yes", "wrangler", "login"], { timeout: 12e4 });
+      const result = await execTool(shell, "npx", ["--yes", "wrangler", "login"], { timeout: 120 });
       if (result.exit_code === 0) {
-        await shell.exec("sh", [
-          "-c",
-          "npx --yes wrangler whoami --json > /tmp/cf_whoami.json 2>/dev/null"
-        ], { timeout: 3e4 });
-        const readResult = await shell.exec("cat", ["/tmp/cf_whoami.json"]);
-        shell.exec("rm", ["-f", "/tmp/cf_whoami.json"]);
-        if (readResult.exit_code === 0 && readResult.stdout.trim()) {
-          const parsedAccounts = parseWhoamiJson(readResult.stdout);
+        const whoamiResult = await execTool(
+          shell,
+          "npx",
+          ["--yes", "wrangler", "whoami", "--json"],
+          { timeout: 30 }
+        );
+        if (whoamiResult.exit_code === 0 && whoamiResult.stdout.trim()) {
+          const parsedAccounts = parseWhoamiJson(whoamiResult.stdout);
           setAccounts(parsedAccounts);
           if (parsedAccounts.length > 0) {
             setCliStatus({ installed: true, authenticated: true });
@@ -1190,22 +1240,24 @@ function CloudflareToolbar() {
     setShowDropdown(false);
     try {
       showToast("Building project...", "success");
-      const buildResult = await shell.exec("npm", ["run", "build"], { timeout: 3e5 });
+      const buildResult = await execTool(shell, "npm", ["run", "build"], { timeout: 300 });
       if (buildResult.exit_code !== 0) {
         showToast(`Build failed: ${buildResult.stderr || buildResult.stdout}`, "error");
         setIsDeploying(false);
         return;
       }
-      const dirCheck = await shell.exec("test", ["-d", linked.outputDir]);
+      const dirCheck = await dirExists(shell, linked.outputDir, { timeout: 10 });
       if (dirCheck.exit_code !== 0) {
         showToast(`Build succeeded but "${linked.outputDir}" folder not found. Check your framework's output settings.`, "error");
         setIsDeploying(false);
         return;
       }
-      const result = await shell.exec(
-        "sh",
-        ["-c", `CLOUDFLARE_ACCOUNT_ID=${linked.accountId} npx --yes wrangler pages deploy ${linked.outputDir} --project-name ${linked.projectName}`],
-        { timeout: 3e5 }
+      const result = await execToolWithEnv(
+        shell,
+        { CLOUDFLARE_ACCOUNT_ID: linked.accountId },
+        "npx",
+        ["--yes", "wrangler", "pages", "deploy", linked.outputDir, "--project-name", linked.projectName],
+        { timeout: 300 }
       );
       if (result.exit_code === 0) {
         if (!linked.prodUrl) {
@@ -1241,7 +1293,7 @@ function CloudflareToolbar() {
   const handleSignOut = useCallback(async () => {
     setShowDropdown(false);
     try {
-      await shell.exec("npx", ["--yes", "wrangler", "logout"], { timeout: 3e4 });
+      await execTool(shell, "npx", ["--yes", "wrangler", "logout"], { timeout: 30 });
       await storage.write({});
       setLinked(null);
       setAccounts([]);
